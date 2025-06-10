@@ -78,21 +78,14 @@ export default class AbandonedCartService extends TransactionBaseService {
     return (cart?.cart_context?.locale as string) || "en";
   }
 
-  async sendAbandonedCartEmail(id: string, interval?: number) {
-    if (!this.options_.sendgridEnabled || !this.sendGridService) {
-      this.logger.info("SendGrid is not enabled, emitting event");
-      await this.eventBusService.emit("cart.send-abandoned-email", {
-        id,
-        interval,
-      });
-      return {
-        success: true,
-        message: "Event emitted, but SendGrid is not enabled.",
-      };
-    }
 
+  private hasAbandonedEmailBeenSent(cart: Cart): boolean {
+    return !!cart.metadata?.abandoned_email_sent_at;
+  }
+
+  async sendAbandonedCartEmail(id: string, interval?: number) {
     try {
-      const cartRepo = this.activeManager_.withRepository(this.cartRepository);
+      const cartRepo = (this as any).activeManager_.withRepository(this.cartRepository);
       const notNullCartsPromise = await cartRepo.findOne({
         where: {
           id,
@@ -108,21 +101,30 @@ export default class AbandonedCartService extends TransactionBaseService {
           "region",
           "context",
           "abandoned_count",
+          "metadata",
         ],
         relations: ["items", "region", "shipping_address"],
       });
-
-      let templateId = this.options_?.templateId;
-      let subject = this.options_?.subject;
-      let header = this.options_?.header;
 
       if (!notNullCartsPromise) {
         throw new MedusaError("Not Found", "Cart not found");
       }
 
-      const cart = this.transformCart(notNullCartsPromise) as TransformedCart;
+      if (this.hasAbandonedEmailBeenSent(notNullCartsPromise)) {
+        this.logger.info(`[AbandonedCartPlugin] Skipping cart ${id}: abandoned email already sent at ${notNullCartsPromise.metadata?.abandoned_email_sent_at}`);
+        return {
+          success: false,
+          message: "Email already sent for this cart",
+        };
+      }
 
+      let templateId = this.options_?.templateId;
+      let subject = this.options_?.subject;
+      let header = this.options_?.header;
+
+      const cart = this.transformCart(notNullCartsPromise) as TransformedCart;
       const locale = this.getCartLocale(cart);
+      
       if (
         this.options_.localization &&
         (!this.checkTypeOfOptions(this.options_) || interval === undefined)
@@ -167,6 +169,44 @@ export default class AbandonedCartService extends TransactionBaseService {
         throw new MedusaError("Invalid", "TemplateId is required");
       }
 
+      const currentMetadata = notNullCartsPromise.metadata || {};
+      const updatedMetadata = {
+        ...currentMetadata,
+        abandoned_email_sent_at: new Date().toISOString(),
+      };
+
+      const cartPromise = cartRepo.update(cart.id, {
+        abandoned_lastdate: new Date().toISOString(),
+        abandoned_count: (notNullCartsPromise?.abandoned_count || 0) + 1,
+        abandoned_last_interval: interval || undefined,
+        abandoned_completed_at:
+          this.checkTypeOfOptions(this.options_) &&
+          this.options_.intervals[this.options_.intervals.length - 1]
+            .interval === interval
+            ? new Date().toISOString()
+            : undefined,
+        metadata: updatedMetadata,
+      });
+
+      // ✅ MODIFY: Single event emission (no more duplicates)
+      const eventPromise = this.eventBusService?.emit(
+        "cart.send-abandoned-email",
+        {
+          id,
+          interval,
+        },
+      );
+
+      if (!this.options_.sendgridEnabled || !this.sendGridService) {
+        this.logger.info("SendGrid is not enabled, event emitted for external handling");
+        await Promise.all([cartPromise, eventPromise]);
+        return {
+          success: true,
+          message: "Event emitted, external email handler should process this.",
+        };
+      }
+
+      // SendGrid is enabled - send email via SendGrid
       const emailData = {
         to: cart.email,
         from: this.options_.from,
@@ -179,33 +219,13 @@ export default class AbandonedCartService extends TransactionBaseService {
       };
 
       const emailPromise = this.sendGridService.sendEmail(emailData);
-      // const emailPromise = Promise.resolve({});
-
-      const cartPromise = cartRepo.update(cart.id, {
-        abandoned_lastdate: new Date().toISOString(),
-        abandoned_count: (notNullCartsPromise?.abandoned_count || 0) + 1,
-        abandoned_last_interval: interval || undefined,
-        abandoned_completed_at:
-          this.checkTypeOfOptions(this.options_) &&
-          this.options_.intervals[this.options_.intervals.length - 1]
-            .interval === interval
-            ? new Date().toISOString()
-            : undefined,
-      });
-
-      const eventPromise = this.eventBusService.emit(
-        "cart.send-abandoned-email",
-        {
-          id,
-          interval,
-        },
-      );
+      
       this.logger.info(`Sending email for cart ${id}`);
       await Promise.all([emailPromise, cartPromise, eventPromise]);
 
       return {
         success: true,
-        message: "Email sent",
+        message: "Email sent via SendGrid",
       };
     } catch (error) {
       this.logger.error("Error sending abandoned cart email", {
@@ -242,7 +262,7 @@ export default class AbandonedCartService extends TransactionBaseService {
     dateLimit?: number,
     fromAdmin?: boolean,
   ): Promise<Cart[]> | Promise<number> => {
-    const cartRepo = this.activeManager_.withRepository(this.cartRepository);
+    const cartRepo = (this as any).activeManager_.withRepository(this.cartRepository);
     return cartRepo
       .createQueryBuilder("cart")
       .leftJoinAndSelect("cart.items", "items")
@@ -289,7 +309,7 @@ export default class AbandonedCartService extends TransactionBaseService {
     if (cartsIds.length === 0) {
       return;
     }
-    const cartRepo = this.activeManager_.withRepository(this.cartRepository);
+    const cartRepo = (this as any).activeManager_.withRepository(this.cartRepository);
 
     this.logger.info(`Completing ${cartsIds.length} abandoned carts`);
     await cartRepo.update(cartsIds, {
