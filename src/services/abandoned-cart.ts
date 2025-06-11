@@ -78,7 +78,25 @@ export default class AbandonedCartService extends TransactionBaseService {
     return (cart?.cart_context?.locale as string) || "en";
   }
 
+  private hasAbandonedEmailBeenSent(cart: Cart): boolean {
+    return !!cart.metadata?.abandoned_email_sent_at;
+  }
+
   async sendAbandonedCartEmail(id: string, interval?: number) {
+    const cartRepo = (this as any).activeManager_.withRepository(this.cartRepository);
+    const cartWithMetadata = await cartRepo.findOne({
+      where: { id },
+      select: ["metadata"],
+    });
+
+    if (cartWithMetadata && this.hasAbandonedEmailBeenSent(cartWithMetadata)) {
+      this.logger.info(`[AbandonedCartPlugin] Skipping cart ${id}: abandoned email already sent at ${cartWithMetadata.metadata?.abandoned_email_sent_at}`);
+      return {
+        success: false,
+        message: "Email already sent for this cart",
+      };
+    }
+
     if (!this.options_.sendgridEnabled || !this.sendGridService) {
       this.logger.info("SendGrid is not enabled, emitting event");
       await this.eventBusService.emit("cart.send-abandoned-email", {
@@ -92,7 +110,6 @@ export default class AbandonedCartService extends TransactionBaseService {
     }
 
     try {
-      const cartRepo = this.activeManager_.withRepository(this.cartRepository);
       const notNullCartsPromise = await cartRepo.findOne({
         where: {
           id,
@@ -108,6 +125,7 @@ export default class AbandonedCartService extends TransactionBaseService {
           "region",
           "context",
           "abandoned_count",
+          "metadata",
         ],
         relations: ["items", "region", "shipping_address"],
       });
@@ -179,7 +197,12 @@ export default class AbandonedCartService extends TransactionBaseService {
       };
 
       const emailPromise = this.sendGridService.sendEmail(emailData);
-      // const emailPromise = Promise.resolve({});
+
+      const currentMetadata = notNullCartsPromise.metadata || {};
+      const updatedMetadata = {
+        ...currentMetadata,
+        abandoned_email_sent_at: new Date().toISOString(),
+      };
 
       const cartPromise = cartRepo.update(cart.id, {
         abandoned_lastdate: new Date().toISOString(),
@@ -191,6 +214,7 @@ export default class AbandonedCartService extends TransactionBaseService {
             .interval === interval
             ? new Date().toISOString()
             : undefined,
+        metadata: updatedMetadata,
       });
 
       const eventPromise = this.eventBusService.emit(
@@ -242,7 +266,7 @@ export default class AbandonedCartService extends TransactionBaseService {
     dateLimit?: number,
     fromAdmin?: boolean,
   ): Promise<Cart[]> | Promise<number> => {
-    const cartRepo = this.activeManager_.withRepository(this.cartRepository);
+    const cartRepo = (this as any).activeManager_.withRepository(this.cartRepository);
     return cartRepo
       .createQueryBuilder("cart")
       .leftJoinAndSelect("cart.items", "items")
@@ -264,7 +288,7 @@ export default class AbandonedCartService extends TransactionBaseService {
           ? "cart.abandoned_completed_at IS NULL"
           : "cart.email IS NOT NULL",
       )
-      .andWhere("items.id IS NOT NULL") // Ensure there are items related to the cart
+      .andWhere("items.id IS NOT NULL")
       .orderBy("cart.created_at", "DESC")
       .select([
         "cart.id",
@@ -289,7 +313,7 @@ export default class AbandonedCartService extends TransactionBaseService {
     if (cartsIds.length === 0) {
       return;
     }
-    const cartRepo = this.activeManager_.withRepository(this.cartRepository);
+    const cartRepo = (this as any).activeManager_.withRepository(this.cartRepository);
 
     this.logger.info(`Completing ${cartsIds.length} abandoned carts`);
     await cartRepo.update(cartsIds, {
