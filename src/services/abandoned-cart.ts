@@ -83,10 +83,10 @@ export default class AbandonedCartService extends TransactionBaseService {
   }
 
   async sendAbandonedCartEmail(id: string, interval?: number) {
-    const cartRepo = (this as any).activeManager_.withRepository(this.cartRepository); // ✅ MINIMAL CHANGE 3: Fix TypeScript
+    const cartRepo = (this as any).activeManager_.withRepository(this.cartRepository);
     const cartWithMetadata = await cartRepo.findOne({
       where: { id },
-      select: ["metadata"], // Just get metadata for the check
+      select: ["metadata"],
     });
 
     if (cartWithMetadata && this.hasAbandonedEmailBeenSent(cartWithMetadata)) {
