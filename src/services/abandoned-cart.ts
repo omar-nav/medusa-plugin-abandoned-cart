@@ -78,14 +78,38 @@ export default class AbandonedCartService extends TransactionBaseService {
     return (cart?.cart_context?.locale as string) || "en";
   }
 
-
   private hasAbandonedEmailBeenSent(cart: Cart): boolean {
     return !!cart.metadata?.abandoned_email_sent_at;
   }
 
   async sendAbandonedCartEmail(id: string, interval?: number) {
+    const cartRepo = (this as any).activeManager_.withRepository(this.cartRepository); // ✅ MINIMAL CHANGE 3: Fix TypeScript
+    const cartWithMetadata = await cartRepo.findOne({
+      where: { id },
+      select: ["metadata"], // Just get metadata for the check
+    });
+
+    if (cartWithMetadata && this.hasAbandonedEmailBeenSent(cartWithMetadata)) {
+      this.logger.info(`[AbandonedCartPlugin] Skipping cart ${id}: abandoned email already sent at ${cartWithMetadata.metadata?.abandoned_email_sent_at}`);
+      return {
+        success: false,
+        message: "Email already sent for this cart",
+      };
+    }
+
+    if (!this.options_.sendgridEnabled || !this.sendGridService) {
+      this.logger.info("SendGrid is not enabled, emitting event");
+      await this.eventBusService.emit("cart.send-abandoned-email", {
+        id,
+        interval,
+      });
+      return {
+        success: true,
+        message: "Event emitted, but SendGrid is not enabled.",
+      };
+    }
+
     try {
-      const cartRepo = (this as any).activeManager_.withRepository(this.cartRepository);
       const notNullCartsPromise = await cartRepo.findOne({
         where: {
           id,
@@ -106,25 +130,17 @@ export default class AbandonedCartService extends TransactionBaseService {
         relations: ["items", "region", "shipping_address"],
       });
 
-      if (!notNullCartsPromise) {
-        throw new MedusaError("Not Found", "Cart not found");
-      }
-
-      if (this.hasAbandonedEmailBeenSent(notNullCartsPromise)) {
-        this.logger.info(`[AbandonedCartPlugin] Skipping cart ${id}: abandoned email already sent at ${notNullCartsPromise.metadata?.abandoned_email_sent_at}`);
-        return {
-          success: false,
-          message: "Email already sent for this cart",
-        };
-      }
-
       let templateId = this.options_?.templateId;
       let subject = this.options_?.subject;
       let header = this.options_?.header;
 
+      if (!notNullCartsPromise) {
+        throw new MedusaError("Not Found", "Cart not found");
+      }
+
       const cart = this.transformCart(notNullCartsPromise) as TransformedCart;
+
       const locale = this.getCartLocale(cart);
-      
       if (
         this.options_.localization &&
         (!this.checkTypeOfOptions(this.options_) || interval === undefined)
@@ -169,6 +185,19 @@ export default class AbandonedCartService extends TransactionBaseService {
         throw new MedusaError("Invalid", "TemplateId is required");
       }
 
+      const emailData = {
+        to: cart.email,
+        from: this.options_.from,
+        templateId: templateId,
+        dynamic_template_data: {
+          ...cart,
+          subject: subject ?? "You left something in your cart",
+          header: header ?? "Still thinking about it?",
+        },
+      };
+
+      const emailPromise = this.sendGridService.sendEmail(emailData);
+
       const currentMetadata = notNullCartsPromise.metadata || {};
       const updatedMetadata = {
         ...currentMetadata,
@@ -188,44 +217,19 @@ export default class AbandonedCartService extends TransactionBaseService {
         metadata: updatedMetadata,
       });
 
-      // ✅ MODIFY: Single event emission (no more duplicates)
-      const eventPromise = this.eventBusService?.emit(
+      const eventPromise = this.eventBusService.emit(
         "cart.send-abandoned-email",
         {
           id,
           interval,
         },
       );
-
-      if (!this.options_.sendgridEnabled || !this.sendGridService) {
-        this.logger.info("SendGrid is not enabled, event emitted for external handling");
-        await Promise.all([cartPromise, eventPromise]);
-        return {
-          success: true,
-          message: "Event emitted, external email handler should process this.",
-        };
-      }
-
-      // SendGrid is enabled - send email via SendGrid
-      const emailData = {
-        to: cart.email,
-        from: this.options_.from,
-        templateId: templateId,
-        dynamic_template_data: {
-          ...cart,
-          subject: subject ?? "You left something in your cart",
-          header: header ?? "Still thinking about it?",
-        },
-      };
-
-      const emailPromise = this.sendGridService.sendEmail(emailData);
-      
       this.logger.info(`Sending email for cart ${id}`);
       await Promise.all([emailPromise, cartPromise, eventPromise]);
 
       return {
         success: true,
-        message: "Email sent via SendGrid",
+        message: "Email sent",
       };
     } catch (error) {
       this.logger.error("Error sending abandoned cart email", {
@@ -284,7 +288,7 @@ export default class AbandonedCartService extends TransactionBaseService {
           ? "cart.abandoned_completed_at IS NULL"
           : "cart.email IS NOT NULL",
       )
-      .andWhere("items.id IS NOT NULL") // Ensure there are items related to the cart
+      .andWhere("items.id IS NOT NULL")
       .orderBy("cart.created_at", "DESC")
       .select([
         "cart.id",
